@@ -1,0 +1,27 @@
+extends layout
+
+block content
+    h1= title
+    p Welcome to #{title}
+    script(src="/socket.io/socket.io.js")
+    script(src="https://code.jquery.com/jquery-3.4.1.min.js")
+    script.
+        $(function () {
+            var socket = io();
+            $('form').submit(function(e){
+              e.preventDefault(); // prevents page reloading
+              socket.emit('chatMessage', $('#m').val());
+              $('#m').val('');
+              return false;
+            });
+            socket.on('chatMessage', function(msg){
+              $('#messages').append($('<li>').text(msg));
+            });
+          });
+    p Activated socket.
+    ul(id="messages")
+        form(action="")
+          input(id="m" autocomplete="off")
+          button Send
+
+

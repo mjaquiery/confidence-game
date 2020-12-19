@@ -1,0 +1,498 @@
+#!/usr/bin/env node
+
+/**
+ * Module dependencies.
+ */
+
+var app = require('../app');
+var debug = require('debug')('confidence-game:server');
+var http = require('http');
+
+/**
+ * Get port from environment and store in Express.
+ */
+
+var port = normalizePort(process.env.PORT || '3000');
+app.set('port', port);
+
+/**
+ * Create HTTP server.
+ */
+
+var server = http.createServer(app);
+
+/**
+ * Listen on provided port, on all network interfaces.
+ */
+
+server.listen(port);
+server.on('error', onError);
+server.on('listening', onListening);
+
+/**
+ * Normalize a port into a number, string, or false.
+ */
+
+function normalizePort(val) {
+  var port = parseInt(val, 10);
+
+  if (isNaN(port)) {
+    // named pipe
+    return val;
+  }
+
+  if (port >= 0) {
+    // port number
+    return port;
+  }
+
+  return false;
+}
+
+/**
+ * Event listener for HTTP server "error" event.
+ */
+
+function onError(error) {
+  if (error.syscall !== 'listen') {
+    throw error;
+  }
+
+  var bind = typeof port === 'string'
+    ? 'Pipe ' + port
+    : 'Port ' + port;
+
+  // handle specific listen errors with friendly messages
+  switch (error.code) {
+    case 'EACCES':
+      console.error(bind + ' requires elevated privileges');
+      process.exit(1);
+      break;
+    case 'EADDRINUSE':
+      console.error(bind + ' is already in use');
+      process.exit(1);
+      break;
+    default:
+      throw error;
+  }
+}
+
+/**
+ * Event listener for HTTP server "listening" event.
+ */
+
+function onListening() {
+  var addr = server.address();
+  var bind = typeof addr === 'string'
+    ? 'pipe ' + addr
+    : 'port ' + addr.port;
+  debug('Listening on ' + bind);
+}
+
+/**
+ * Socket stuff
+ */
+
+var io = require('socket.io')(server, {
+  cors: {
+    origin: "http://localhost:8080",
+    methods: ["GET", "POST"]
+  }
+});
+
+/**
+ * @class BaseObject
+ * @classdesc Inherits the input object's properties
+ */
+class BaseObject {
+  /**
+   * Produce an object from a template input
+   * @param input {null|{}}
+   */
+  constructor(input) {
+    if (input !== null) {
+      for (const k of Object.keys(input)) {
+        if (input.hasOwnProperty(k))
+          this[k] = input[k];
+      }
+    }
+  }
+}
+
+/**
+ * @class Question
+ * @classdesc Questions define prompts and record answers
+ * @property prompt {string} Question text
+ * @property truth {number} Actual answer
+ * @property trivia {string} Additional information to display once the question is answered
+ * @property answers {{playerId: number, answer: Answer}[]} named list of answers
+ * @property id {number} index of the question in the ConfidenceGame controller
+ */
+class Question extends BaseObject {
+  /**
+   * Questions players in the game have to answer
+   * @param question {null|{prompt: string, truth: number, trivia: string}}
+   */
+  constructor(question) {
+    super(question);
+    this.answers = [];
+    this.voids = [];
+    this.id = -1;
+  }
+
+  /**
+   * Add a player's answer to the answer list
+   * @param player {Player}
+   * @param answer {Answer}
+   */
+  addAnswer(player, answer) {
+    this.answers.push({playerId: player.id, answer: answer});
+  }
+
+  /**
+   * Mark a player as not participating in this question
+   * @param player {Player}
+   */
+  voidAnswer(player) {
+    this.voids.push(player.id);
+  }
+
+  /**
+   * Return the number of players who have either answered or decided not to answer
+   * @return {number}
+   */
+  get playersFinished() {
+    return this.answers.length + this.voids.length;
+  }
+}
+
+/**
+ * @class Answer
+ * @classdesc Answers have a minimum and maximum value to define a range
+ * @property min {number} bottom end of the range
+ * @property max {number} top end of the range (>=min)
+ */
+class Answer {
+  constructor(min, max) {
+    if (min > max || !isFinite(min) || !isFinite(max))
+      throw new Error(`Bad answer format (min = ${min}, max = ${max}): Answers must contain two numbers, the first less than or equal to the second.`);
+    this.min = min;
+    this.max = max;
+    this._score = null;
+  }
+
+  /**
+   * Range of the answer
+   * @return {number}
+   */
+  get range() {return this.max - this.min}
+
+  /**
+   * Set the score awarded for this answer
+   * @param points {number}
+   */
+  setScore(points) {
+    this._score = points;
+  }
+
+  /**
+   * Get the score awarded for this answer
+   * @return {number}
+   */
+  get score() {return this._score}
+}
+
+/**
+ * @property id {number} internal identifier
+ * @property socket {Socket}
+ * @property name {string}
+ */
+class Player extends BaseObject {
+  /**
+   * Player in the game
+   * @param player {null|{id: number, socket: Socket, name: string}}
+   */
+  constructor(player) {
+    super(player);
+  }
+}
+
+class ConfidenceGame {
+  /**
+   * Set up the confidence game
+   * @param io {Server} socketIo object
+   */
+  constructor(io) {
+    this._questions = [
+      {
+        prompt: "How tall is Yao Ming in millimeters?",
+        truth: 2290,
+        trivia: "At 7'6'', he was the tallest active player in the NBA while he played."
+      },
+      {
+        prompt: "How many questions do I have in this quiz?",
+        truth: 2,
+        trivia: "We're only testing, after all."
+      }
+    ];
+    // Add an ID to each question
+    this.questions = [];
+    this.answerTime = 5000; // Time other people have to answer
+    this.scoreMax = 15;
+    this.scoreWrong = 0;
+    this.scoreCorrect = 1;
+    this.scoreBest = 3;
+    this.players = [];
+    this._io = io;
+    this._maxId = 0;
+    this._questionIndex = 0;
+    this._gameState = 'awaiting players';
+    this._answerClockTimeout = null;
+  }
+
+  /**
+   * Reset the questions and begin again
+   */
+  startNewGame() {
+    this.updateGameState('game start');
+    this._questionIndex = 0;
+    this.questions = this.newQuestionSet();
+    this.beginRound();
+  }
+
+  /**
+   * Send out a question prompt
+   */
+  beginRound() {
+    console.log(`New round: "${this.currentQuestion.prompt}"`);
+    this.updateGameState('round start');
+    this._io.emit('newPrompt', this.currentQuestion.prompt);
+  }
+
+  nextRound() {
+    this._questionIndex++;
+    if (this._questionIndex >= this.questions.length) {
+      this.questions = [...this.questions, ...this.newQuestionSet()];
+    }
+    this.beginRound();
+  }
+
+  /**
+   * Handle incoming answers
+   * @param socket {Socket}
+   * @param answer {{min: number, max: number}}
+   */
+  receiveAnswer(socket, answer) {
+    console.log(`Socket ${socket.id} -> ${answer.min} to ${answer.max}`)
+    const player = this.playerIdFromSocketId(socket.id);
+    if (!player) {
+      socket.emit('error', 'You sent an answer but are not registered as a player');
+      return;
+    }
+    try {answer = new Answer(answer.min, answer.max);}
+    catch(e) {
+      socket.emit('error', `You sent me a bad answer: ${e}`);
+      this.currentQuestion.voidAnswer(player);
+      return;
+    }
+
+    this.currentQuestion.addAnswer(player, answer);
+
+    this.broadcastAnswers("receivedAnswer");
+    if (this.currentQuestion.playersFinished === this.players.length) {
+      clearTimeout(this._answerClockTimeout);
+      this._answerClockTimeout = null;
+      this.markRound();
+    } else if (!this._answerClockTimeout) {
+      this.updateGameState('hurrying answers');
+      this._answerClockTimeout = setTimeout(()=>this.markRound(), this.answerTime);
+    }
+  }
+
+  /**
+   * Assign scores to players who answered and broadcast them
+   */
+  markRound() {
+    this._answerClockTimeout = null;
+    this.updateGameState('marking answers');
+    const game = this;
+    const Q = this.currentQuestion;
+    const correctAnswers = [];
+    Q.answers.forEach(a => {
+      const answer = a.answer;
+      if (answer.min <= Q.truth && answer.max >= Q.truth) {
+          correctAnswers.push(answer);
+          answer.setScore(game.scoreCorrect);
+      } else {
+        answer.setScore(game.scoreWrong);
+      }
+    });
+    if (correctAnswers.length) {
+      // Reward the best players
+      const lowestRange = correctAnswers.reduce((prev, curr) => {
+        if (!prev.range)
+          return curr;
+        if (curr.range < prev.range)
+          return curr;
+        return prev;
+      });
+      correctAnswers.filter(a => a.range === lowestRange.range)
+          .forEach(a => a.setScore(game.scoreBest));
+    }
+
+    // Have we got an overall winner?
+    const winners = this.players.filter(p => game.playerScore(p) >= game.scoreMax);
+    if (!winners.length) {
+      this.broadcastAnswers("results");
+      this.nextRound();
+    } else {
+      this.endGame();
+    }
+  }
+
+  endGame() {
+    this.updateGameState('game end');
+  }
+
+  /**
+   * Fisher-Yates algorithm implementation taken from https://stackoverflow.com/a/2450976
+   * @return {Question[]}
+   */
+  newQuestionSet() {
+    let Qs = this._questions;
+    let currentIndex = Qs.length;
+    let temporaryValue;
+    let randomIndex;
+    // While there remain elements to shuffle...
+    while(0 !== currentIndex) {
+      // Pick a remaining element...
+      randomIndex = Math.floor(Math.random() * currentIndex);
+      currentIndex -= 1;
+      // And swap it with the current element.
+      temporaryValue = Qs[currentIndex];
+      Qs[currentIndex] = Qs[randomIndex];
+      Qs[randomIndex] = temporaryValue;
+    }
+    Qs = Qs.map(q => new Question(q));
+    let i = this.questions? this.questions.length : 0;
+    Qs.forEach(q => q.id = i++);
+    return Qs;
+  }
+
+  /**
+   * Add a player to the game
+   * @param socket {Socket} player's connection socket
+   * @param name {string} player name
+   */
+  addPlayer(socket, name) {
+    const player = new Player({id: this.nextPlayerId, socket: socket, name: name});
+    this.players.push(player);
+    socket.broadcast.emit('newPlayer', player.id);
+    if (this.players.length === 2)
+      this.startNewGame();
+  }
+
+  /**
+   * Get the next free id number for a player
+   * @return {number}
+   */
+  get nextPlayerId() {
+    return ++this._maxId;
+  }
+
+  /**
+   * Get a player by their socket ID
+   * @param socketId {string}
+   * @return {Player|null}
+   */
+  playerIdFromSocketId(socketId) {
+    const matches = this.players.filter(p => p.socket.id === socketId);
+    if(matches)
+      return matches[0];
+    else
+      return null;
+  }
+
+  /**
+   * Remove a player from the game
+   * @param player {Player}
+   */
+  dropPlayer(player) {
+    this.players = this.players.filter(p => p.id !== player.id);
+    player.socket.broadcast.emit('playerDropped', player.id);
+  }
+
+  /**
+   * Return the question the players are currently answering
+   * @return {Question}
+   */
+  get currentQuestion() {
+    return this.questions[this._questionIndex];
+  }
+
+  /**
+   * Return a player's current total score
+   * @param player {Player}
+   * @return {number}
+   */
+  playerScore(player) {
+    return this.questions.map(q => {
+      const answers = q.answers.filter(a => a.playerId === player.id);
+      if (answers.length)
+        return answers[0].answer.score;
+      return 0;
+    }).reduce((p, c) => p + c);
+  }
+
+  /**
+   * Update the game state and broadcast to clients
+   * @param newState {string}
+   */
+  updateGameState(newState) {
+    this._gameState = newState;
+    this.broadcastGameState();
+  }
+
+  /**
+   * Send the game state to clients
+   */
+  broadcastGameState() {this._io.emit('gameState', this._gameState);}
+
+  /**
+   * Send clients' answers to one another
+   * @param eventName {"receivedAnswer"|"results"} Name of the event.
+   */
+  broadcastAnswers(eventName) {
+    const i = this._questionIndex;
+    const answers = this.questions.filter(q => q.id <= i)
+        .map(q => {
+          const out = {prompt: q.prompt, answers: q.answers, voids: q.voids, id: q.id};
+          if (eventName === 'results' || q.id !== i) {
+            out.truth = q.truth;
+            out.trivia = q.trivia;
+          }
+          return out;
+        });
+
+    console.log({answers})
+    this._io.emit(eventName, answers);
+  }
+}
+
+const game = new ConfidenceGame(io);
+
+io.on('connection', (socket) => {
+  console.log('a user connected');
+  console.log({socketId: socket.id});
+  socket.broadcast.emit('A new player has connected.');
+  game.addPlayer(socket, socket.id);
+  game.broadcastGameState();
+
+  socket.on('disconnect', () => {
+    console.log('user disconnected');
+    socket.broadcast.emit('A user has left the channel');
+    game.dropPlayer(game.playerIdFromSocketId(socket.id));
+  });
+
+  socket.on('sendAnswer', (answer) => game.receiveAnswer(socket, answer));
+});
