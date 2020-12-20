@@ -373,10 +373,10 @@ class ConfidenceGame {
       Qs[currentIndex] = Qs[randomIndex];
       Qs[randomIndex] = temporaryValue;
     }
-    Qs = Qs.map(q => new Question(q));
+    const out = Qs.map(q => new Question(q));
     let i = this.questions? this.questions.length : 0;
-    Qs.forEach(q => q.id = i++);
-    return Qs;
+    out.forEach(q => q.id = i++);
+    return out;
   }
 
   /**
