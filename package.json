@@ -6,6 +6,9 @@
     "start": "node ./bin/www"
   },
   "dependencies": {
+    "array-shuffle": "^2.0.0",
+    "chroma-js": "^2.1.0",
+    "color-sequences": "0.0.8",
     "cookie-parser": "~1.4.4",
     "debug": "~2.6.9",
     "express": "~4.16.1",

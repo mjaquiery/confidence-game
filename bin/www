@@ -7,6 +7,8 @@
 var app = require('../app');
 var debug = require('debug')('confidence-game:server');
 var http = require('http');
+var chroma = require('chroma-js');
+var arrayShuffle = require('array-shuffle');
 
 /**
  * Get port from environment and store in Express.
@@ -173,8 +175,13 @@ class Question extends BaseObject {
  * @property max {number} top end of the range (>=min)
  */
 class Answer {
-  constructor(min, max) {
-    if (min > max || !isFinite(min) || !isFinite(max))
+  /**
+   * @param min {number}
+   * @param max {number}
+   * @param allowInfinite {boolean}
+   */
+  constructor(min, max, allowInfinite = false) {
+    if ((min > max || !isFinite(min) || !isFinite(max)) && !allowInfinite)
       throw new Error(`Bad answer format (min = ${min}, max = ${max}): Answers must contain two numbers, the first less than or equal to the second.`);
     this.min = min;
     this.max = max;
@@ -210,10 +217,11 @@ class Answer {
 class Player extends BaseObject {
   /**
    * Player in the game
-   * @param player {null|{id: number, socket: Socket, name: string}}
+   * @param player {null|{id: number, socket: Socket, name: string, color: {base: string, light: string, dark: string, saturated: string, desaturated: string}}}
    */
   constructor(player) {
     super(player);
+    this.name = player.name || player.socket.id;
   }
 }
 
@@ -238,16 +246,29 @@ class ConfidenceGame {
     // Add an ID to each question
     this.questions = [];
     this.answerTime = 5000; // Time other people have to answer
+    this.roundStartDelay = 10000; // Time between rounds
     this.scoreMax = 15;
     this.scoreWrong = 0;
     this.scoreCorrect = 1;
     this.scoreBest = 3;
+    this.colorHueStart = Math.floor(Math.random() * 100);
     this.players = [];
     this._io = io;
     this._maxId = 0;
     this._questionIndex = 0;
     this._gameState = 'awaiting players';
     this._answerClockTimeout = null;
+
+    this.colors = chroma.brewer.Accent.map(c => {
+      return {
+        base: c,
+        light: chroma(c).brighten().hex(),
+        dark: chroma(c).darken().hex(),
+        desaturated: chroma(c).desaturate().hex(),
+        saturated: chroma(c).saturate().hex()
+      }
+    });
+    this._colorIndices = arrayShuffle(this.colors.map((c, i) => i));
   }
 
   /**
@@ -256,7 +277,7 @@ class ConfidenceGame {
   startNewGame() {
     this.updateGameState('game start');
     this._questionIndex = 0;
-    this.questions = this.newQuestionSet();
+    this.questions = this.newQuestionSet(false);
     this.beginRound();
   }
 
@@ -289,6 +310,11 @@ class ConfidenceGame {
       socket.emit('error', 'You sent an answer but are not registered as a player');
       return;
     }
+    // Check the player hasn't answered already
+    if (this.currentQuestion.answers.filter(a => a.playerId === player.id).length) {
+      socket.emit('error', 'You already sent me an answer for this question');
+      return;
+    }
     try {answer = new Answer(answer.min, answer.max);}
     catch(e) {
       socket.emit('error', `You sent me a bad answer: ${e}`);
@@ -298,7 +324,6 @@ class ConfidenceGame {
 
     this.currentQuestion.addAnswer(player, answer);
 
-    this.broadcastAnswers("receivedAnswer");
     if (this.currentQuestion.playersFinished === this.players.length) {
       clearTimeout(this._answerClockTimeout);
       this._answerClockTimeout = null;
@@ -306,7 +331,8 @@ class ConfidenceGame {
     } else if (!this._answerClockTimeout) {
       this.updateGameState('hurrying answers');
       this._answerClockTimeout = setTimeout(()=>this.markRound(), this.answerTime);
-    }
+    } else
+      this.broadcastGameState();
   }
 
   /**
@@ -339,12 +365,21 @@ class ConfidenceGame {
       correctAnswers.filter(a => a.range === lowestRange.range)
           .forEach(a => a.setScore(game.scoreBest));
     }
+    // Award any players who didn't answer with points if necessary
+    this.players.forEach(p => {
+      const answers = Q.answers.filter(q => q.playerId === p.id);
+      if (!answers.length) {
+        const answer = new Answer(-Infinity, Infinity, true);
+        answer.setScore(game.scoreWrong);
+        Q.addAnswer(p, answer);
+      }
+    });
 
     // Have we got an overall winner?
     const winners = this.players.filter(p => game.playerScore(p) >= game.scoreMax);
     if (!winners.length) {
-      this.broadcastAnswers("results");
-      this.nextRound();
+      this.updateGameState("results");
+      setTimeout(()=>this.nextRound(), this.roundStartDelay);
     } else {
       this.endGame();
     }
@@ -355,26 +390,13 @@ class ConfidenceGame {
   }
 
   /**
-   * Fisher-Yates algorithm implementation taken from https://stackoverflow.com/a/2450976
+   * @param append {boolean} whether to append the trials to the current questions
    * @return {Question[]}
    */
-  newQuestionSet() {
-    let Qs = this._questions;
-    let currentIndex = Qs.length;
-    let temporaryValue;
-    let randomIndex;
-    // While there remain elements to shuffle...
-    while(0 !== currentIndex) {
-      // Pick a remaining element...
-      randomIndex = Math.floor(Math.random() * currentIndex);
-      currentIndex -= 1;
-      // And swap it with the current element.
-      temporaryValue = Qs[currentIndex];
-      Qs[currentIndex] = Qs[randomIndex];
-      Qs[randomIndex] = temporaryValue;
-    }
+  newQuestionSet(append = true) {
+    const Qs = arrayShuffle(this._questions);
     const out = Qs.map(q => new Question(q));
-    let i = this.questions? this.questions.length : 0;
+    let i = (this.questions && append)? this.questions.length : 0;
     out.forEach(q => q.id = i++);
     return out;
   }
@@ -385,8 +407,14 @@ class ConfidenceGame {
    * @param name {string} player name
    */
   addPlayer(socket, name) {
-    const player = new Player({id: this.nextPlayerId, socket: socket, name: name});
+    const player = new Player({
+      id: this.nextPlayerId,
+      socket: socket,
+      name: name,
+      color: this.getNextPlayerColor()
+    });
     this.players.push(player);
+    socket.emit('yourPlayerId', player.id);
     socket.broadcast.emit('newPlayer', player.id);
     if (this.players.length === 2)
       this.startNewGame();
@@ -423,6 +451,13 @@ class ConfidenceGame {
   }
 
   /**
+   * Update player colours to accomodate a new player
+   */
+  getNextPlayerColor() {
+    return this.colors[this.players.length % this._colorIndices.length];
+  }
+
+  /**
    * Return the question the players are currently answering
    * @return {Question}
    */
@@ -445,6 +480,30 @@ class ConfidenceGame {
   }
 
   /**
+   * Return the points scored on each question Player scored on
+   * @param player {Player}
+   * @return {{questionId: number, score: number}[]}
+   */
+  getPlayerScorecard(player) {
+    const scorecard = [];
+    if(!this.questions.length)
+      return scorecard;
+    for (let i = 0; i <= this._questionIndex; i++) {
+      const answers = this.questions[i].answers
+          .filter(a => a.playerId === player.id);
+      if (answers.length) {
+        const answer = answers[0];
+        if (answer.answer.score > 0)
+          scorecard.push({
+            questionId: this.questions[i].id,
+            score: answer.answer.score
+          });
+      }
+    }
+    return scorecard;
+  }
+
+  /**
    * Update the game state and broadcast to clients
    * @param newState {string}
    */
@@ -456,40 +515,62 @@ class ConfidenceGame {
   /**
    * Send the game state to clients
    */
-  broadcastGameState() {this._io.emit('gameState', this._gameState);}
+  broadcastGameState() {this._io.emit('gameState', this.toGameState);}
 
-  /**
-   * Send clients' answers to one another
-   * @param eventName {"receivedAnswer"|"results"} Name of the event.
-   */
-  broadcastAnswers(eventName) {
+  get toGameState() {
     const i = this._questionIndex;
-    const answers = this.questions.filter(q => q.id <= i)
+    console.log(`Q${this._questionIndex} / [${this.questions.map(q => q.id).join(", ")}]`)
+    const questions = this.questions.filter(q => q.id <= i)
         .map(q => {
-          const out = {prompt: q.prompt, answers: q.answers, voids: q.voids, id: q.id};
-          if (eventName === 'results' || q.id !== i) {
+          const out = {prompt: q.prompt, id: q.id};
+          // Don't give away the answer to the current Q until results stage
+          if (this._gameState === 'results' || q.id !== i) {
             out.truth = q.truth;
             out.trivia = q.trivia;
+            out.answers = q.answers;
           }
           return out;
         });
+    const players = this.players.map(p => {
+      const scorecard = this.getPlayerScorecard(p);
+      return {id: p.id, name: p.name, color: p.color, scorecard};
+    });
+    const gameState = {
+      players,
+      questions,
+      gameState: this._gameState,
+      rules: this.rules
+    };
+    // console.log(gameState)
+    return gameState;
+  }
 
-    console.log({answers})
-    this._io.emit(eventName, answers);
+  /**
+   * Get the game rules
+   * @return {{scoreCorrect: number, scoreBest: number, scoreWrong: number, scoreMax: number, hurryTime: number}}
+   */
+  get rules() {
+    return {
+      scoreWrong: this.scoreWrong,
+      scoreCorrect: this.scoreCorrect,
+      scoreBest: this.scoreBest,
+      scoreMax: this.scoreMax,
+      hurryTime: this.answerTime,
+      roundGapTime: this.roundStartDelay
+    }
   }
 }
 
 const game = new ConfidenceGame(io);
 
 io.on('connection', (socket) => {
-  console.log('a user connected');
-  console.log({socketId: socket.id});
+  console.log(`user ${socket.id} connected`);
   socket.broadcast.emit('A new player has connected.');
   game.addPlayer(socket, socket.id);
   game.broadcastGameState();
 
   socket.on('disconnect', () => {
-    console.log('user disconnected');
+    console.log(`user ${socket.id} disconnected`);
     socket.broadcast.emit('A user has left the channel');
     game.dropPlayer(game.playerIdFromSocketId(socket.id));
   });

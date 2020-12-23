@@ -14,8 +14,14 @@ block content
               $('#m').val('');
               return false;
             });
-            socket.on('chatMessage', function(msg){
-              $('#messages').append($('<li>').text(msg));
+            socket.on('gameState', function(gs){
+                if(gs.gameState === 'hurrying answers') {
+                    var min = Math.floor(Math.random() * 10);
+                    var range = Math.floor(Math.random() * 100);
+                    var max = min + range;
+                    console.log({min, max});
+                    socket.emit('sendAnswer', {min, max});
+                }
             });
           });
     p Activated socket.
